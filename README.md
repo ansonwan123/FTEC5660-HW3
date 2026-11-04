@@ -170,14 +170,46 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
-### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+`CHOSEN_POINTS = [1, 2, 5]`. All three are answered from the database, against the company's own industry row in `industry_medians`. PASS means strictly above that median. The gaps on the public set are several percentage points, so the comparison is not sitting on a rounding line.
+
+### Point 1 — market potential
+
+Fisher asks whether the company has "products or services with sufficient market potential to make possible a sizable increase in sales for at least several years." I use that as a relative test, not a fixed growth rate: a packaging-machinery firm and a semiconductor-equipment firm do not share a growth hurdle. PASS if revenue from `orders` in FY2025 is more than the FY2023 revenue by a larger percentage than `revenue_growth_2y_pct` for the company's industry. FY2026 is only a half year, so it stays out of the ratio.
+
+### Point 2 — new products as current lines mature
+
+Fisher asks whether management keeps developing products "when the growth potentials of currently attractive product lines have largely been exploited." A company that is still living off old lines fails this even if total sales are rising. PASS if products with `launch_date` on or after 2023-01-01 account for a larger share of FY2025 revenue than `new_product_share_pct`.
+
+### Point 5 — worthwhile profit margin
+
+Fisher asks for a "worthwhile profit margin," and he compares companies with their competitors rather than with a universal percentage. PASS if FY2025 operating margin is above `operating_margin_pct`. Operating margin is (FY2025 revenue − cost of sales − selling and admin − R&D) / FY2025 revenue, with the three costs summed from `monthly_costs` for January through December 2025.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    companies[One company folder] --> sql["sql_query: one SELECT"]
+    sql --> py[Python: growth, new-product share, operating margin]
+    py --> cmp{Each figure above its industry median?}
+    cmp --> verdicts["PASS or FAIL on points 1, 2 and 5"]
+    verdicts --> note["deepseek-v4-flash writes two sentences"]
+    note --> row[results.csv]
+```
+
+Each company is one LangChain `sql_query` call. The statement joins `company` to `industry_medians` and aggregates `orders`, `products` and `monthly_costs`, so the 50-row cap never matters. Python parses that single row and applies the three comparisons. `deepseek-v4-flash` does not choose the verdict and does not do the arithmetic. It only turns the figures into a two-sentence note, with thinking disabled. Companies run concurrently, five at a time. If the model call fails, the same figures are written out by Python, and a failure on one company does not drop the others.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+On `public_test`, 20 companies and 3 points: 60/60, balanced accuracy 100.0%. No company disagrees with `ground_truth.json` on points 1, 2 or 5. The six failures on point 1 are the companies whose two-year revenue growth is below their industry median (Cobalt, Driftwood, Halcyon, Ironbark, Juniper, Kestrel). The six failures on point 2 are the companies whose post-2022 products are a smaller share of FY2025 sales than the industry median (Ashgrove, Dunmore, Elmstead, Granite, Halcyon, Ironbark). The six failures on point 5 are the companies whose FY2025 operating margin is below the industry median (Everline, Falcrest, Halcyon, Ironbark, Lindale, Northwind).
+
+## Task 2: Reflection
+
+Sycophancy is a model agreeing with the person in front of it. Psychosis, in the sense people now use the word around chatbots, is what happens after that agreement runs for a long time: the user and the model build a private story, nothing in the loop contradicts it, and the story starts to replace the evidence.
+
+The shareholder letters in this homework are a small version of the first problem. Management talks about markets, research and margins in the voice of someone who wants the reader to agree. A model that is trained to be helpful will treat that voice as the answer, because the letter is fluent and the question sounds like it has already been answered. Fisher's method is the opposite. He sends the investor to orders, costs, customers and former employees, and he treats a polished explanation as a claim, not as proof. The useful design here is the same one I would want around a credit memo or a research note: the model may phrase the conclusion, and ordinary code decides it from the tables.
+
+The second problem is closer to how these tools get used. If every draft comes back warmer and more certain than the last, a weak idea acquires a file of supporting paragraphs. There is no customer who says the sales force only sends a price list, and no cash-flow line that fails to cover the capex plan. The conversation feels like progress because the model never has a reason to stop. A person who is tired, or who already wants a particular stock, will not notice the moment the file stopped referring to anything outside itself.
+
+I do not think the fix is a smarter model. A smarter model is a more convincing partner in the same loop. The fix is a source the model cannot edit, a verdict it is not allowed to calculate, and a person who has to look at a disagreement before anything is sent. This assignment grades the disagreement. That is the part worth keeping.

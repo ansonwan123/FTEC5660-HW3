@@ -57,7 +57,43 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 2, 5]  ### YOUR CODE HERE
+
+# One row. Ratios are computed here, not in the model.
+# Point 1: FY2023-FY2025 revenue growth versus the industry median.
+# Point 2: FY2025 sales from products launched since 2023-01-01, as a share of
+#          FY2025 revenue, versus the industry median.
+# Point 5: FY2025 operating margin versus the industry median.
+METRICS_SQL = """
+SELECT
+    c.name AS company,
+    c.industry AS industry,
+    m.revenue_growth_2y_pct AS med_growth,
+    m.new_product_share_pct AS med_new_share,
+    m.operating_margin_pct AS med_margin,
+    (SELECT SUM(amount) FROM orders
+        WHERE order_date >= '2023-01-01' AND order_date < '2024-01-01') AS rev_2023,
+    (SELECT SUM(amount) FROM orders
+        WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01') AS rev_2025,
+    (SELECT COALESCE(SUM(o.amount), 0) FROM orders o
+        JOIN products p ON p.product = o.product
+        WHERE o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'
+          AND p.launch_date >= '2023-01-01') AS new_rev_2025,
+    (SELECT SUM(cost_of_sales) FROM monthly_costs
+        WHERE month >= '2025-01' AND month <= '2025-12') AS cos_2025,
+    (SELECT SUM(selling_admin) FROM monthly_costs
+        WHERE month >= '2025-01' AND month <= '2025-12') AS sa_2025,
+    (SELECT SUM(research_development) FROM monthly_costs
+        WHERE month >= '2025-01' AND month <= '2025-12') AS rd_2025
+FROM company c
+JOIN industry_medians m ON m.industry = c.industry
+""".strip()
+
+_SUMMARY_SYSTEM = (
+    "You write a two-sentence investment note. "
+    "Use only the figures you are given. Do not change the verdicts. "
+    "No preamble."
+)
 
 
 def build_agent() -> Any:
@@ -72,7 +108,100 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    # Verdicts are arithmetic. The model only writes the note, so keep thinking off.
+    model = ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        max_tokens=300,
+        timeout=90,
+        max_retries=2,
+        # Identity encoding avoids a broken brotli decoder on some Windows installs.
+        default_headers={"Accept-Encoding": "identity"},
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", _SUMMARY_SYSTEM),
+            ("human", "{facts}"),
+        ]
+    )
+    return prompt | model
+
+
+def _parse_metrics(text: str) -> dict[str, Any]:
+    """Parse the one-row table returned by sql_query."""
+    if text.startswith("SQL error:"):
+        raise RuntimeError(text)
+    lines = [line for line in text.splitlines() if line and not line.startswith("...")]
+    if len(lines) < 2:
+        raise RuntimeError(f"unexpected sql result: {text[:200]}")
+    header = [cell.strip() for cell in lines[0].split("|")]
+    values = [cell.strip() for cell in lines[1].split("|")]
+    if len(header) != len(values):
+        raise RuntimeError(f"unexpected sql result: {text[:200]}")
+    row: dict[str, Any] = {}
+    for key, value in zip(header, values):
+        if key in ("company", "industry"):
+            row[key] = value
+        else:
+            row[key] = float(value)
+    return row
+
+
+def _judge(row: dict[str, Any]) -> tuple[dict[int, str], str]:
+    """PASS when the company is strictly above the industry median."""
+    growth = (row["rev_2025"] / row["rev_2023"] - 1.0) * 100.0
+    new_share = row["new_rev_2025"] / row["rev_2025"] * 100.0
+    margin = (
+        row["rev_2025"] - row["cos_2025"] - row["sa_2025"] - row["rd_2025"]
+    ) / row["rev_2025"] * 100.0
+    points = {
+        1: "PASS" if growth > row["med_growth"] else "FAIL",
+        2: "PASS" if new_share > row["med_new_share"] else "FAIL",
+        5: "PASS" if margin > row["med_margin"] else "FAIL",
+    }
+    facts = (
+        f"{row['company']} ({row['industry']}). "
+        f"Point 1 {points[1]}: FY2023-FY2025 revenue growth {growth:.1f}% "
+        f"versus industry median {row['med_growth']:.1f}%. "
+        f"Point 2 {points[2]}: products launched since 2023 were {new_share:.1f}% "
+        f"of FY2025 revenue versus industry median {row['med_new_share']:.1f}%. "
+        f"Point 5 {points[5]}: FY2025 operating margin {margin:.1f}% "
+        f"versus industry median {row['med_margin']:.1f}%."
+    )
+    return points, facts
+
+
+def _fallback_summary(points: dict[int, str], facts: str) -> str:
+    verdicts = ", ".join(f"point {p} {points[p]}" for p in CHOSEN_POINTS)
+    return f"{verdicts}. {facts}"
+
+
+async def _summarize(chain: Any, facts: str, points: dict[int, str]) -> str:
+    if chain is None:
+        return _fallback_summary(points, facts)
+    try:
+        message = await chain.ainvoke({"facts": facts})
+        text = str(getattr(message, "content", message)).strip()
+        return text or _fallback_summary(points, facts)
+    except Exception:
+        return _fallback_summary(points, facts)
+
+
+async def _analyze_one(chain: Any, name: str, tools: list[Any]) -> dict[str, Any]:
+    try:
+        raw = await asyncio.to_thread(tools[2].invoke, {"query": METRICS_SQL})
+        points, facts = _judge(_parse_metrics(str(raw)))
+        summary = await _summarize(chain, facts, points)
+        return {"points": points, "summary": summary}
+    except Exception as exc:
+        return {
+            "points": {},
+            "summary": f"Could not score {name}: {exc}",
+        }
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +238,15 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    # The sql_query tool is the third tool. Cap concurrent summary calls.
+    gate = asyncio.Semaphore(5)
+
+    async def limited(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with gate:
+            return name, await _analyze_one(agent, name, tools)
+
+    pairs = await asyncio.gather(*(limited(name, tools) for name, tools in companies.items()))
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
